@@ -8,6 +8,12 @@ Volume attachments create a lockfile with the designated owner as the contents (
 cat <<'EOF' > /etc/libvirt-storage-attach.yaml
 lock_path: /var/lib/libvirt-storage-attach
 volume_group: fedora_localhost-live/pool00
+
+# Optional config
+qemu_url: qemu:///system
+attach_timeout: 2500ms
+detach_timeout: 2500ms
+volume_prefix: pv-
 EOF
 ```
 
