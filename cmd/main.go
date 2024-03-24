@@ -24,14 +24,14 @@ import (
 )
 
 const DefaultConfigPath = "/etc/libvirt-storage-attach.yaml"
-const AttachTimeout = 2500
-const DetachTimeout = 2500
-const QemuUrl = string(libvirt.QEMUSystem)
-const VolumePrefix = "pv-"
 
 type config struct {
-	LockPath       string `yaml:"lock_path"`
-	LvmVolumeGroup string `yaml:"volume_group"`
+	LockPath       string        `yaml:"lock_path"`
+	LvmVolumeGroup string        `yaml:"volume_group"`
+	QemuUrl        string        `yaml:"qemu_url"`
+	AttachTimeout  time.Duration `yaml:"attach_timeout"`
+	DetachTimeout  time.Duration `yaml:"detach_timeout"`
+	VolumePrefix   string        `yaml:"volume_prefix"`
 }
 
 type lockedVmContext struct {
@@ -58,7 +58,7 @@ func loadConfig(conf *config) {
 		panic(err)
 	}
 
-	log.Printf("loaded conf %v\n", conf)
+	klog.Infof("loaded conf %v", conf)
 
 	if err := os.MkdirAll(conf.LockPath, 0755); err != nil {
 		panic(err)
@@ -68,7 +68,14 @@ func loadConfig(conf *config) {
 func main() {
 	klog.InitFlags(nil)
 
-	var cfg config
+	cfg := config{
+		LockPath:       "",
+		LvmVolumeGroup: "",
+		QemuUrl:        "qemu:///system",
+		AttachTimeout:  2500 * time.Millisecond,
+		DetachTimeout:  2500 * time.Millisecond,
+		VolumePrefix:   "pv-",
+	}
 	loadConfig(&cfg)
 
 	var operation string
@@ -164,7 +171,7 @@ type deviceSummary struct {
 	NextTarget      string
 }
 
-func detectBlockDevices(domainName string) (deviceSummary, error) {
+func detectBlockDevices(cfg config, domainName string) (deviceSummary, error) {
 	summary := deviceSummary{
 		UsedTargets:     map[string]bool{},
 		AttachedDevices: map[string]bool{},
@@ -172,7 +179,7 @@ func detectBlockDevices(domainName string) (deviceSummary, error) {
 		NextTarget:      "",
 	}
 
-	uri, _ := url.Parse(QemuUrl)
+	uri, _ := url.Parse(cfg.QemuUrl)
 	virtConn, err := libvirt.ConnectToURI(uri)
 	defer virtConn.Disconnect()
 	if err != nil {
@@ -206,7 +213,7 @@ func detectBlockDevices(domainName string) (deviceSummary, error) {
 
 		deviceParts := strings.Split(device, "/")
 		deviceId := deviceParts[len(deviceParts)-1]
-		if strings.HasPrefix(deviceId, VolumePrefix) {
+		if strings.HasPrefix(deviceId, cfg.VolumePrefix) {
 			summary.AttachedDevices[deviceId] = true
 			summary.DeviceXml[deviceId] = dev.OutputXML(true)
 		}
@@ -298,7 +305,7 @@ func writeTempFile(suffix, contents string) (string, error) {
 }
 
 func (c *lockedVmContext) attach() error {
-	summary, err := detectBlockDevices(c.VmName)
+	summary, err := detectBlockDevices(c.Cfg, c.VmName)
 	if err != nil {
 		return err
 	}
@@ -321,11 +328,11 @@ func (c *lockedVmContext) attach() error {
 			return err
 		}
 
-		timeout, _ := context.WithTimeout(c.Ctx, AttachTimeout*time.Millisecond)
+		timeout, _ := context.WithTimeout(c.Ctx, c.Cfg.AttachTimeout)
 		stdout, stderr, err := processOutput(exec.CommandContext(
 			timeout,
 			"virsh",
-			fmt.Sprintf("--connect=%s", QemuUrl),
+			fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
 			"attach-device",
 			c.VmName,
 			xmlFilePath,
@@ -352,8 +359,8 @@ func (c *lockedVmContext) attach() error {
 func (c *lockedVmContext) detach() error {
 	var err error
 
-	timeout, _ := context.WithTimeout(c.Ctx, DetachTimeout*time.Millisecond)
-	summary, err := detectBlockDevices(c.VmName)
+	timeout, _ := context.WithTimeout(c.Ctx, c.Cfg.DetachTimeout)
+	summary, err := detectBlockDevices(c.Cfg, c.VmName)
 	if err != nil {
 		return err
 	}
@@ -369,7 +376,7 @@ func (c *lockedVmContext) detach() error {
 		stdout, stderr, err := processOutput(
 			exec.CommandContext(
 				timeout, "virsh",
-				fmt.Sprintf("--connect=%s", QemuUrl),
+				fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
 				"detach-device",
 				c.VmName,
 				xmlFilePath,
@@ -394,7 +401,7 @@ func (c *lockedVmContext) createVolume(volumeSize datasize.ByteSize) (string, er
 	if err != nil {
 		return "", err
 	}
-	c.PvId = fmt.Sprintf("%s%s", VolumePrefix, pvUuid.String())
+	c.PvId = fmt.Sprintf("%s%s", c.Cfg.VolumePrefix, pvUuid.String())
 
 	klog.InfoS("creating logical volume", "pv-id", c.PvId, "size", volumeSize)
 	// Create LV
