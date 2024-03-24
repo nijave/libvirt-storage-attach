@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 	"io"
+	"k8s.io/klog/v2"
 	"log"
 	"net/url"
 	"os"
@@ -26,6 +27,7 @@ const DefaultConfigPath = "/etc/libvirt-storage-attach.yaml"
 const AttachTimeout = 2500
 const DetachTimeout = 2500
 const QemuUrl = string(libvirt.QEMUSystem)
+const VolumePrefix = "pv-"
 
 type config struct {
 	LockPath       string `yaml:"lock_path"`
@@ -64,6 +66,8 @@ func loadConfig(conf *config) {
 }
 
 func main() {
+	klog.InitFlags(nil)
+
 	var cfg config
 	loadConfig(&cfg)
 
@@ -83,7 +87,7 @@ func main() {
 	flag.Parse()
 
 	if ok := map[string]bool{"attach": true, "detach": true, "create": true}[operation]; !ok {
-		panic(errors.New("operation should be one of (attach, detach, create)"))
+		klog.Fatal(errors.New("operation should be one of (attach, detach, create)"))
 	}
 
 	if operation == "attach" || operation == "detach" {
@@ -96,62 +100,60 @@ func main() {
 		}
 
 		if len(vmName) < 1 {
-			panic(errors.New("vm-name must be set"))
+			klog.Fatal(errors.New("vm-name must be set"))
 		}
 	}
 
 	if operation == "create" {
 		if len(volumeSizeText) < 1 {
-			panic(errors.New("size must be set for create operation"))
+			klog.Fatal(errors.New("size must be set for create operation"))
 		}
 
 		if err := volumeSize.UnmarshalText([]byte(volumeSizeText)); err != nil {
-			panic(err)
+			klog.Fatal(err)
 		}
 
 		if volumeSize < datasize.GB {
-			panic(errors.New("size must be at least 1GB"))
+			klog.Fatal(errors.New("size must be at least 1GB"))
 		}
 	}
 
-	log.Printf("operation: %s, pv-id: %s\n", operation, pvId)
+	klog.InfoS("running", "operation", operation, "pv-id", pvId, "vm-name", vmName, "volumeSize", volumeSize)
 
 	var err error
 	switch operation {
 	case "attach":
 		c := lockedVmContext{
-			Ctx:    context.TODO(),
+			Ctx:    context.Background(),
 			Cfg:    cfg,
 			VmName: vmName,
 			PvId:   pvId,
-			PvLock: nil,
-			VmLock: nil,
 		}
 		err = c.withLock(c.attach)
 
 	case "detach":
 		c := lockedVmContext{
-			Ctx:    context.TODO(),
+			Ctx:    context.Background(),
 			Cfg:    cfg,
 			VmName: vmName,
 			PvId:   pvId,
-			PvLock: nil,
-			VmLock: nil,
 		}
 		err = c.withLock(c.detach)
 
 	case "create":
 		c := lockedVmContext{
-			Ctx:  context.TODO(),
+			Ctx:  context.Background(),
 			Cfg:  cfg,
 			PvId: "",
 		}
 		pvId, err = c.createVolume(volumeSize)
-		fmt.Println(pvId)
+		if len(pvId) > 0 {
+			fmt.Println(pvId)
+		}
 	}
 
 	if err != nil {
-		panic(err)
+		klog.Fatal(err)
 	}
 }
 
@@ -162,7 +164,7 @@ type deviceSummary struct {
 	NextTarget      string
 }
 
-func detectBlockDevices(domainName string) deviceSummary {
+func detectBlockDevices(domainName string) (deviceSummary, error) {
 	summary := deviceSummary{
 		UsedTargets:     map[string]bool{},
 		AttachedDevices: map[string]bool{},
@@ -174,32 +176,29 @@ func detectBlockDevices(domainName string) deviceSummary {
 	virtConn, err := libvirt.ConnectToURI(uri)
 	defer virtConn.Disconnect()
 	if err != nil {
-		log.Fatal(err)
+		return summary, err
 	}
 
 	domain, err := virtConn.DomainLookupByName(domainName)
 	if err != nil {
-		log.Fatal(err)
+		return summary, err
 	}
 	domainXml, err := virtConn.DomainGetXMLDesc(domain, 0)
 	if err != nil {
-		log.Fatal(err)
+		return summary, err
 	}
-	//log.Println(domainXml)
 	doc, err := xmlquery.Parse(strings.NewReader(domainXml))
-	//testXmlFile, _ := os.Open("/home/nick/domain.xml")
-	//defer testXmlFile.Close()
-	//doc, err := xmlquery.Parse(testXmlFile)
 	if err != nil {
-		log.Println(err)
+		return summary, err
 	}
+
 	// If a VM has a file-backed disk, disk.type = file
 	//result := xmlquery.Find(doc, "//domain/devices/disk[@type='block']")
 	result := xmlquery.Find(doc, "//domain/devices/disk[@device='disk']")
 	for _, dev := range result {
 		device := xmlquery.FindOne(dev, "/source").SelectAttr("dev")
 		target := xmlquery.FindOne(dev, "/target").SelectAttr("dev")
-		log.Printf("found device: %s %s\n", target, device)
+		klog.InfoS("found device", "vm-name", domainName, "target", target, "device", device)
 
 		if strings.HasPrefix(target, "sd") || strings.HasPrefix(target, "vd") {
 			summary.UsedTargets[target[2:]] = true
@@ -207,7 +206,7 @@ func detectBlockDevices(domainName string) deviceSummary {
 
 		deviceParts := strings.Split(device, "/")
 		deviceId := deviceParts[len(deviceParts)-1]
-		if strings.HasPrefix(deviceId, "pv-") {
+		if strings.HasPrefix(deviceId, VolumePrefix) {
 			summary.AttachedDevices[deviceId] = true
 			summary.DeviceXml[deviceId] = dev.OutputXML(true)
 		}
@@ -228,7 +227,7 @@ outer:
 	}
 	summary.NextTarget = "vd" + summary.NextTarget
 
-	return summary
+	return summary, nil
 }
 
 func (c *lockedVmContext) withLock(fn func() error) error {
@@ -246,28 +245,28 @@ func (c *lockedVmContext) withLock(fn func() error) error {
 
 	pvOwner := bytes.NewBuffer(nil)
 	io.Copy(pvOwner, pvLock)
-	log.Printf("%s owned by %s\n", c.PvId, pvOwner.Bytes())
+	klog.InfoS("device ownership", "pv-id", c.PvId, "vm-name", pvOwner.Bytes())
 
 	if pvOwner.Len() > 0 && pvOwner.String() != c.VmName {
-		log.Fatalf("pv %s is in use can't be modified by '%s' since it's locked by '%s'", c.PvId, c.VmName, pvOwner.String())
+		return fmt.Errorf("pv %s is in use can't be modified by '%s' since it's locked by '%s'", c.PvId, c.VmName, pvOwner.String())
 	}
 
 	if pvOwner.Len() == 0 {
 		_, err := c.PvLock.WriteString(c.VmName)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
 
 	innerError := fn()
 
 	if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_UN); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	c.VmLock = nil
 
 	if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_UN); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	c.PvLock = nil
 
@@ -275,6 +274,7 @@ func (c *lockedVmContext) withLock(fn func() error) error {
 }
 
 func processOutput(cmd *exec.Cmd) (string, string, error) {
+	klog.InfoS("processing output", "command", cmd.Args)
 	bytesOut, err := cmd.Output()
 	stdout := strings.TrimRight(string(bytesOut), "\n\t\r ")
 
@@ -298,9 +298,12 @@ func writeTempFile(suffix, contents string) (string, error) {
 }
 
 func (c *lockedVmContext) attach() error {
-	summary := detectBlockDevices(c.VmName)
+	summary, err := detectBlockDevices(c.VmName)
+	if err != nil {
+		return err
+	}
 	if _, attached := summary.AttachedDevices[c.PvId]; !attached {
-		log.Printf("attaching %s to %s as %s\n", c.PvId, c.VmName, summary.NextTarget)
+		klog.InfoS("attaching device", "pv-id", c.PvId, "vm-name", c.VmName, "target", summary.NextTarget)
 
 		// attach code (after writing state update to lock)
 		devicePath := fmt.Sprintf("/dev/%s/%s", strings.Split(c.Cfg.LvmVolumeGroup, "/")[0], c.PvId)
@@ -315,11 +318,10 @@ func (c *lockedVmContext) attach() error {
 		deviceXml := fmt.Sprintf(deviceXmlTmpl, devicePath, summary.NextTarget, c.PvId)
 		xmlFilePath, err := writeTempFile(c.PvId, deviceXml)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		timeout, _ := context.WithTimeout(c.Ctx, AttachTimeout*time.Millisecond)
-		log.Printf("virsh attach-device %s %s", c.VmName, xmlFilePath)
 		stdout, stderr, err := processOutput(exec.CommandContext(
 			timeout,
 			"virsh",
@@ -332,8 +334,7 @@ func (c *lockedVmContext) attach() error {
 		os.Remove(xmlFilePath)
 
 		if err != nil {
-			log.Printf("lvcreate out: %s\n", stdout)
-			log.Printf("lvcreate err: %s\n", stderr)
+			klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
 			return err
 		}
 
@@ -342,7 +343,7 @@ func (c *lockedVmContext) attach() error {
 			return fmt.Errorf("unexpected output '%s' from virsh", stdout)
 		}
 	} else {
-		log.Printf("%s already attached to %s\n", c.PvId, c.VmName)
+		klog.Warningf("%s already attached to %s", c.PvId, c.VmName)
 	}
 
 	return nil
@@ -352,14 +353,17 @@ func (c *lockedVmContext) detach() error {
 	var err error
 
 	timeout, _ := context.WithTimeout(c.Ctx, DetachTimeout*time.Millisecond)
-	summary := detectBlockDevices(c.VmName)
+	summary, err := detectBlockDevices(c.VmName)
+	if err != nil {
+		return err
+	}
 	if deviceXml, ok := summary.DeviceXml[c.PvId]; ok {
-		log.Printf("Found XML for attached device: %s\n", deviceXml)
+		klog.InfoS("found device xml", "pv-id", c.PvId, "vm-name", c.VmName, "xml", deviceXml)
 
 		// Remove from VM
 		xmlFilePath, err := writeTempFile(c.PvId, deviceXml)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		stdout, stderr, err := processOutput(
@@ -372,15 +376,14 @@ func (c *lockedVmContext) detach() error {
 			),
 		)
 		if err != nil {
-			log.Printf("lvcreate out: %s\n", stdout)
-			log.Printf("lvcreate err: %s\n", stderr)
+			klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
 			return err
 		}
 
 		// Remove from lock
 		return c.PvLock.Truncate(0)
 	} else {
-		log.Fatal(fmt.Errorf("couldn't find %s in devices for %s", c.PvId, c.VmName))
+		return fmt.Errorf("couldn't find %s in devices for %s", c.PvId, c.VmName)
 	}
 
 	return err
@@ -391,9 +394,9 @@ func (c *lockedVmContext) createVolume(volumeSize datasize.ByteSize) (string, er
 	if err != nil {
 		return "", err
 	}
-	c.PvId = fmt.Sprintf("pv-%s", pvUuid.String())
+	c.PvId = fmt.Sprintf("%s%s", VolumePrefix, pvUuid.String())
 
-	log.Printf("creating pv of size %s with id %s", volumeSize.String(), c.PvId)
+	klog.InfoS("creating logical volume", "pv-id", c.PvId, "size", volumeSize)
 	// Create LV
 	stdout, stderr, err := processOutput(
 		exec.CommandContext(
@@ -408,8 +411,7 @@ func (c *lockedVmContext) createVolume(volumeSize datasize.ByteSize) (string, er
 	)
 
 	if err != nil {
-		log.Printf("lvcreate out: %s\n", stdout)
-		log.Printf("lvcreate err: %s\n", stderr)
+		klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
 		return "", err
 	}
 
