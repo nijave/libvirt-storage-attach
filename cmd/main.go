@@ -72,7 +72,7 @@ func main() {
 
 	switch operation {
 	case "attach":
-		c := internal.LockedVmContext{
+		c := internal.LockingVmContext{
 			Ctx:    context.Background(),
 			Cfg:    cfg,
 			VmName: vmName,
@@ -81,7 +81,7 @@ func main() {
 		err = c.WithLock(c.Attach)
 
 	case "detach":
-		c := internal.LockedVmContext{
+		c := internal.LockingVmContext{
 			Ctx:    context.Background(),
 			Cfg:    cfg,
 			VmName: vmName,
@@ -90,7 +90,7 @@ func main() {
 		err = c.WithLock(c.Detach)
 
 	case "create":
-		c := internal.LockedVmContext{
+		c := internal.LockingVmContext{
 			Ctx:  context.Background(),
 			Cfg:  cfg,
 			PvId: "",

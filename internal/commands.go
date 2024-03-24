@@ -16,7 +16,7 @@ import (
 	"strings"
 )
 
-type LockedVmContext struct {
+type LockingVmContext struct {
 	Ctx    context.Context
 	Cfg    *Config
 	VmName string
@@ -25,7 +25,7 @@ type LockedVmContext struct {
 	VmLock *os.File
 }
 
-func (c *LockedVmContext) WithLock(fn func() error) error {
+func (c *LockingVmContext) WithLock(fn func() error) error {
 	vmLock, _ := os.Create(filepath.Join(c.Cfg.LockPath, c.VmName))
 	if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		log.Fatal(err)
@@ -68,7 +68,7 @@ func (c *LockedVmContext) WithLock(fn func() error) error {
 	return innerError
 }
 
-func (c *LockedVmContext) Attach() error {
+func (c *LockingVmContext) Attach() error {
 	summary, err := detectBlockDevices(c.Cfg, c.VmName)
 	if err != nil {
 		return err
@@ -120,7 +120,7 @@ func (c *LockedVmContext) Attach() error {
 	return nil
 }
 
-func (c *LockedVmContext) Detach() error {
+func (c *LockingVmContext) Detach() error {
 	var err error
 
 	timeout, _ := context.WithTimeout(c.Ctx, c.Cfg.DetachTimeout)
@@ -160,7 +160,7 @@ func (c *LockedVmContext) Detach() error {
 	return err
 }
 
-func (c *LockedVmContext) CreateVolume(volumeSize datasize.ByteSize) (string, error) {
+func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize) (string, error) {
 	pvUuid, err := uuid.NewV7()
 	if err != nil {
 		return "", err
