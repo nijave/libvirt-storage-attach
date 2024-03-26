@@ -22,7 +22,7 @@ func main() {
 	}
 
 	var operation string
-	flag.StringVar(&operation, "operation", "", "attach, detach, or create")
+	flag.StringVar(&operation, "operation", "", "attach, detach, create, delete")
 
 	var pvId string
 	flag.StringVar(&pvId, "pv-id", "", "persistent volume id")
@@ -36,7 +36,7 @@ func main() {
 
 	flag.Parse()
 
-	if ok := map[string]bool{"attach": true, "detach": true, "create": true}[operation]; !ok {
+	if ok := map[string]bool{"attach": true, "detach": true, "create": true, "delete": true}[operation]; !ok {
 		klog.Fatal(errors.New("operation should be one of (attach, detach, create)"))
 	}
 
@@ -68,6 +68,16 @@ func main() {
 		}
 	}
 
+	if operation == "delete" {
+		pvIdFormatError := errors.New("pv-id should be in format pv-<uuid>")
+		if len(pvId) != 39 {
+			panic(pvIdFormatError)
+		}
+		if _, err := uuid.Parse(pvId[3:]); err != nil {
+			panic(pvIdFormatError)
+		}
+	}
+
 	klog.InfoS("running", "operation", operation, "pv-id", pvId, "vm-name", vmName, "volumeSize", volumeSize)
 
 	switch operation {
@@ -78,7 +88,7 @@ func main() {
 			VmName: vmName,
 			PvId:   pvId,
 		}
-		err = c.WithLock(c.Attach)
+		err = c.WithLock(true, c.Attach)
 
 	case "detach":
 		c := internal.LockingVmContext{
@@ -87,7 +97,7 @@ func main() {
 			VmName: vmName,
 			PvId:   pvId,
 		}
-		err = c.WithLock(c.Detach)
+		err = c.WithLock(true, c.Detach)
 
 	case "create":
 		c := internal.LockingVmContext{
@@ -99,6 +109,15 @@ func main() {
 		if len(pvId) > 0 {
 			fmt.Println(pvId)
 		}
+
+	case "delete":
+		c := internal.LockingVmContext{
+			Ctx:    context.Background(),
+			Cfg:    cfg,
+			PvId:   pvId,
+			VmName: "",
+		}
+		err = c.WithLock(false, c.DeleteVolume)
 	}
 
 	if err != nil {

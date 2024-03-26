@@ -25,12 +25,15 @@ type LockingVmContext struct {
 	VmLock *os.File
 }
 
-func (c *LockingVmContext) WithLock(fn func() error) error {
-	vmLock, _ := os.Create(filepath.Join(c.Cfg.LockPath, c.VmName))
-	if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		log.Fatal(err)
+func (c *LockingVmContext) WithLock(lockVm bool, fn func() error) error {
+	var vmLock *os.File
+	if lockVm {
+		vmLock, _ := os.Create(filepath.Join(c.Cfg.LockPath, c.VmName))
+		if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			log.Fatal(err)
+		}
+		c.VmLock = vmLock
 	}
-	c.VmLock = vmLock
 
 	pvLock, _ := os.OpenFile(filepath.Join(c.Cfg.LockPath, c.PvId), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err := unix.Flock(int(pvLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
@@ -55,12 +58,14 @@ func (c *LockingVmContext) WithLock(fn func() error) error {
 
 	innerError := fn()
 
-	if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_UN); err != nil {
-		return err
+	if vmLock != nil {
+		if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_UN); err != nil {
+			return err
+		}
+		c.VmLock = nil
 	}
-	c.VmLock = nil
 
-	if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_UN); err != nil {
+	if err := unix.Flock(int(pvLock.Fd()), unix.LOCK_UN); err != nil {
 		return err
 	}
 	c.PvLock = nil
@@ -188,4 +193,25 @@ func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize) (string, e
 
 	// TODO handle orphaned LVs created without having UUID returned successfully
 	return c.PvId, nil
+}
+
+func (c *LockingVmContext) DeleteVolume() error {
+	klog.InfoS("deleting logical volume", "pv-id", c.PvId)
+	stdout, stderr, err := processOutput(
+		exec.CommandContext(
+			c.Ctx,
+			"lvremove",
+			"--yes",
+			strings.Join([]string{
+				strings.Split(c.Cfg.LvmVolumeGroup, "/")[0],
+				c.PvId,
+			}, "/"),
+		),
+	)
+
+	if err != nil {
+		klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
+	}
+
+	return err
 }

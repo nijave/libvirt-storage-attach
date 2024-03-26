@@ -21,6 +21,9 @@ EOF
 ### Create
 `pvId=$(libvirt-storage-attach -operation=create 4GB | tail -n 1)`
 
+### Delete
+`libvirt-storage-attach -operation=delete -pv-id=$pvId`
+
 ### Attach
 `libvirt-storage-attach -operation=attach -vm-name=my-vm -pv-id=$pvId`
 
