@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,16 +10,19 @@ import (
 	"github.com/google/uuid"
 	"k8s.io/klog/v2"
 	"libvirt-storage-attach/internal"
+	"os"
 )
 
 func main() {
 	var err error
 	klog.InitFlags(nil)
+	klog.SetOutput(os.Stderr)
 
 	var cfg *internal.Config
 	cfg, err = internal.LoadConfig()
 	if err != nil {
-		klog.Fatal(err)
+		klog.Error(err)
+		os.Exit(255)
 	}
 
 	var operation string
@@ -36,8 +40,9 @@ func main() {
 
 	flag.Parse()
 
-	if ok := map[string]bool{"attach": true, "detach": true, "create": true, "delete": true}[operation]; !ok {
-		klog.Fatal(errors.New("operation should be one of (attach, detach, create)"))
+	if ok := map[string]bool{"attach": true, "detach": true, "list": true, "create": true, "delete": true}[operation]; !ok {
+		klog.Error(errors.New("operation should be one of (attach, detach, create)"))
+		os.Exit(255)
 	}
 
 	if operation == "attach" || operation == "detach" {
@@ -50,21 +55,25 @@ func main() {
 		}
 
 		if len(vmName) < 1 {
-			klog.Fatal(errors.New("vm-name must be set"))
+			klog.Error(errors.New("vm-name must be set"))
+			os.Exit(255)
 		}
 	}
 
 	if operation == "create" {
 		if len(volumeSizeText) < 1 {
-			klog.Fatal(errors.New("size must be set for create operation"))
+			klog.Error(errors.New("size must be set for create operation"))
+			os.Exit(255)
 		}
 
 		if err := volumeSize.UnmarshalText([]byte(volumeSizeText)); err != nil {
-			klog.Fatal(err)
+			klog.Error(err)
+			os.Exit(255)
 		}
 
 		if volumeSize < datasize.GB {
-			klog.Fatal(errors.New("size must be at least 1GB"))
+			klog.Error(errors.New("size must be at least 1GB"))
+			os.Exit(255)
 		}
 	}
 
@@ -99,6 +108,19 @@ func main() {
 		}
 		err = c.WithLock(true, c.Detach)
 
+	case "list":
+		c := internal.LockingVmContext{
+			Ctx: context.Background(),
+			Cfg: cfg,
+		}
+		var out []*internal.VolumeInfo
+		out, err = c.ListVolumes()
+		if err == nil {
+			var outJson []byte
+			outJson, err = json.Marshal(out)
+			fmt.Println(string(outJson))
+		}
+
 	case "create":
 		c := internal.LockingVmContext{
 			Ctx:  context.Background(),
@@ -121,6 +143,7 @@ func main() {
 	}
 
 	if err != nil {
-		klog.Fatal(err)
+		klog.Error(err)
+		os.Exit(1)
 	}
 }

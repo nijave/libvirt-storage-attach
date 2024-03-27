@@ -1,15 +1,14 @@
 package internal
 
 import (
-	"bytes"
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/c2h5oh/datasize"
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
-	"io"
 	"k8s.io/klog/v2"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,26 +29,25 @@ func (c *LockingVmContext) WithLock(lockVm bool, fn func() error) error {
 	if lockVm {
 		vmLock, _ := os.Create(filepath.Join(c.Cfg.LockPath, c.VmName))
 		if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-			log.Fatal(err)
+			return err
 		}
 		c.VmLock = vmLock
 	}
 
 	pvLock, _ := os.OpenFile(filepath.Join(c.Cfg.LockPath, c.PvId), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err := unix.Flock(int(pvLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	c.PvLock = pvLock
 
-	pvOwner := bytes.NewBuffer(nil)
-	io.Copy(pvOwner, pvLock)
-	klog.InfoS("device ownership", "pv-id", c.PvId, "vm-name", pvOwner.Bytes())
+	pvOwner := bufio.NewScanner(pvLock).Text()
+	klog.InfoS("device ownership", "pv-id", c.PvId, "vm-name", pvOwner)
 
-	if pvOwner.Len() > 0 && pvOwner.String() != c.VmName {
-		return fmt.Errorf("pv %s is in use can't be modified by '%s' since it's locked by '%s'", c.PvId, c.VmName, pvOwner.String())
+	if len(pvOwner) > 0 && pvOwner != c.VmName {
+		return fmt.Errorf("pv %s is in use can't be modified by '%s' since it's locked by '%s'", c.PvId, c.VmName, pvOwner)
 	}
 
-	if pvOwner.Len() == 0 {
+	if len(pvOwner) == 0 {
 		_, err := c.PvLock.WriteString(c.VmName)
 		if err != nil {
 			return err
@@ -91,7 +89,8 @@ func (c *LockingVmContext) Attach() error {
   <serial>%s</serial>
 </disk>
 `
-		deviceXml := fmt.Sprintf(deviceXmlTmpl, devicePath, summary.NextTarget, c.PvId)
+		deviceSerial := strings.Replace(strings.TrimPrefix(c.PvId, c.Cfg.VolumePrefix), "-", "", -1)
+		deviceXml := fmt.Sprintf(deviceXmlTmpl, devicePath, summary.NextTarget, deviceSerial)
 		xmlFilePath, err := writeTempFile(c.PvId, deviceXml)
 		if err != nil {
 			return err
@@ -159,10 +158,78 @@ func (c *LockingVmContext) Detach() error {
 		// Remove from lock
 		return c.PvLock.Truncate(0)
 	} else {
-		return fmt.Errorf("couldn't find %s in devices for %s", c.PvId, c.VmName)
+		klog.Warningf("couldn't find %s in devices for %s", c.PvId, c.VmName)
+		return nil
+	}
+}
+
+type VolumeInfo struct {
+	Id       string
+	Capacity uint64
+	Owners   []string
+}
+
+func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
+	var volumeInfo []*VolumeInfo
+
+	stdout, stderr, err := processOutput(exec.CommandContext(
+		c.Ctx,
+		"lvs",
+		"--noheadings",
+		"--units",
+		"B",
+		"-o",
+		"name,size",
+		"--select",
+		fmt.Sprintf(
+			"name=~%s[^.]+ && vg_name=%s",
+			c.Cfg.VolumePrefix,
+			strings.Split(c.Cfg.LvmVolumeGroup, "/")[0],
+		),
+	))
+
+	if err != nil || strings.HasPrefix(stderr, "WARNING: ") {
+		klog.InfoS("command output", "command", "lvs", "stdout", stdout, "stderr", stderr, "err", err)
+		if err == nil && strings.Contains(stderr, "Permission denied") {
+			err = errors.New("permission denied")
+		}
+		return volumeInfo, err
 	}
 
-	return err
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		line = strings.TrimSpace(line)
+		parts := strings.Split(line, " ")
+		dataSize, _ := datasize.Parse([]byte(parts[1]))
+		volumeInfo = append(volumeInfo, &VolumeInfo{
+			Id:       parts[0],
+			Capacity: dataSize.Bytes(),
+			Owners:   nil,
+		})
+	}
+
+	for _, volume := range volumeInfo {
+		pvLock, err := os.OpenFile(
+			filepath.Join(c.Cfg.LockPath, volume.Id),
+			0,
+			0600,
+		)
+
+		if err != nil {
+			klog.Warningf("%s %s", volume.Id, err.Error())
+		} else {
+			owner := bufio.NewScanner(pvLock).Text()
+			if len(owner) > 0 {
+				volume.Owners = []string{owner}
+				continue
+			}
+		}
+
+		volume.Owners = []string{}
+	}
+
+	klog.InfoS("volume list", "volumes", volumeInfo)
+
+	return volumeInfo, nil
 }
 
 func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize) (string, error) {
@@ -187,7 +254,7 @@ func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize) (string, e
 	)
 
 	if err != nil {
-		klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
+		klog.InfoS("command output", "command", "lvcreate", "stdout", stdout, "stderr", stderr, "err", err)
 		return "", err
 	}
 
@@ -210,7 +277,7 @@ func (c *LockingVmContext) DeleteVolume() error {
 	)
 
 	if err != nil {
-		klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
+		klog.InfoS("command output", "command", "lvremove", "stdout", stdout, "stderr", stderr, "err", err)
 	}
 
 	return err

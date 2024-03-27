@@ -45,7 +45,7 @@ func detectBlockDevices(cfg *Config, domainName string) (deviceSummary, error) {
 
 	// If a VM has a file-backed disk, disk.type = file
 	//result := xmlquery.Find(doc, "//domain/devices/disk[@type='block']")
-	result := xmlquery.Find(doc, "//domain/devices/disk[@device='disk']")
+	result := xmlquery.Find(doc, "//domain/devices/disk")
 	for _, dev := range result {
 		device := xmlquery.FindOne(dev, "/source").SelectAttr("dev")
 		target := xmlquery.FindOne(dev, "/target").SelectAttr("dev")
