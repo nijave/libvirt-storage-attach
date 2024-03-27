@@ -18,6 +18,9 @@ EOF
 ```
 
 ## Usage
+### List
+`libvirt-storage-attach -operation=list`
+
 ### Create
 `pvId=$(libvirt-storage-attach -operation=create 4GB | tail -n 1)`
 
