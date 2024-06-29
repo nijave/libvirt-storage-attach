@@ -102,16 +102,32 @@ func (c *LockingVmContext) Attach() error {
 			"virsh",
 			fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
 			"attach-device",
+			"--current",
 			c.VmName,
 			xmlFilePath,
 		))
-
-		os.Remove(xmlFilePath)
 
 		if err != nil {
 			klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
 			return err
 		}
+
+		stdout, stderr, err = processOutput(exec.CommandContext(
+			timeout,
+			"virsh",
+			fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
+			"attach-device",
+			"--persistent",
+			c.VmName,
+			xmlFilePath,
+		))
+
+		if err != nil {
+			klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
+			//return err
+		}
+
+		os.Remove(xmlFilePath)
 
 		// TODO maybe exit code = 0 is sufficient
 		if stdout != "Device attached successfully" {
@@ -129,9 +145,15 @@ func (c *LockingVmContext) Detach() error {
 
 	timeout, _ := context.WithTimeout(c.Ctx, c.Cfg.DetachTimeout)
 	summary, err := detectBlockDevices(c.Cfg, c.VmName)
+
+	if err != nil && strings.HasPrefix(err.Error(), "Domain not found: ") {
+		return nil
+	}
+
 	if err != nil {
 		return err
 	}
+
 	if deviceXml, ok := summary.DeviceXml[c.PvId]; ok {
 		klog.InfoS("found device xml", "pv-id", c.PvId, "vm-name", c.VmName, "xml", deviceXml)
 
@@ -180,6 +202,8 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 		"B",
 		"-o",
 		"name,size",
+		"--separator",
+		"\t",
 		"--select",
 		fmt.Sprintf(
 			"name=~%s[^.]+ && vg_name=%s",
@@ -196,36 +220,49 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 		return volumeInfo, err
 	}
 
+	attachedPvs := listAllAttachedPvs(c.Cfg)
+
 	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
 		line = strings.TrimSpace(line)
-		parts := strings.Split(line, " ")
+		parts := strings.Split(line, "\t")
+		klog.InfoS("parsing lvs line", "line", parts)
 		dataSize, _ := datasize.Parse([]byte(parts[1]))
-		volumeInfo = append(volumeInfo, &VolumeInfo{
-			Id:       parts[0],
-			Capacity: dataSize.Bytes(),
-			Owners:   nil,
-		})
-	}
-
-	for _, volume := range volumeInfo {
-		pvLock, err := os.OpenFile(
-			filepath.Join(c.Cfg.LockPath, volume.Id),
-			0,
-			0600,
-		)
-
-		if err != nil {
-			klog.Warningf("%s %s", volume.Id, err.Error())
-		} else {
-			owner := bufio.NewScanner(pvLock).Text()
-			if len(owner) > 0 {
-				volume.Owners = []string{owner}
-				continue
+		pvId := parts[0]
+		if strings.HasPrefix(pvId, c.Cfg.VolumePrefix) && len(pvId) == len(c.Cfg.VolumePrefix)+36 {
+			owners := &[]string{}
+			klog.InfoS("checking for pv owners", "pv", pvId)
+			if domain, ok := attachedPvs[pvId]; ok {
+				owners = &[]string{domain}
 			}
+			volumeInfo = append(volumeInfo, &VolumeInfo{
+				Id:       parts[0],
+				Capacity: dataSize.Bytes(),
+				Owners:   *owners,
+			})
 		}
 
-		volume.Owners = []string{}
 	}
+
+	// TODO For some reason all the lock files are empty
+	//for _, volume := range volumeInfo {
+	//	pvLock, err := os.OpenFile(
+	//		filepath.Join(c.Cfg.LockPath, volume.Id),
+	//		0,
+	//		0600,
+	//	)
+	//
+	//	if err != nil {
+	//		klog.Warningf("%s %s", volume.Id, err.Error())
+	//	} else {
+	//		owner := bufio.NewScanner(pvLock).Text()
+	//		if len(owner) > 0 {
+	//			volume.Owners = []string{owner}
+	//			continue
+	//		}
+	//	}
+	//
+	//	volume.Owners = []string{}
+	//}
 
 	klog.InfoS("volume list", "volumes", volumeInfo)
 
