@@ -57,7 +57,8 @@ func detectBlockDevices(cfg *Config, domainName string) (deviceSummary, error) {
 
 		deviceParts := strings.Split(device, "/")
 		deviceId := deviceParts[len(deviceParts)-1]
-		if strings.HasPrefix(deviceId, cfg.VolumePrefix) {
+		// It starts with the prefix and is length prefix + uuid length
+		if strings.HasPrefix(deviceId, cfg.VolumePrefix) && len(deviceId) == len(cfg.VolumePrefix)+36 {
 			summary.AttachedDevices[deviceId] = true
 			summary.DeviceXml[deviceId] = dev.OutputXML(true)
 		}
@@ -79,4 +80,53 @@ outer:
 	summary.NextTarget = "vd" + summary.NextTarget
 
 	return summary, nil
+}
+
+func listDomains(cfg *Config) ([]string, error) {
+	var domains []string
+
+	uri, _ := url.Parse(cfg.QemuUrl)
+	virtConn, err := libvirt.ConnectToURI(uri)
+	defer virtConn.Disconnect()
+	if err != nil {
+		return domains, err
+	}
+
+	domainList, _, err := virtConn.ConnectListAllDomains(1, 0)
+
+	if err != nil {
+		return domains, err
+	}
+
+	domains = make([]string, len(domainList))
+	for i, domain := range domainList {
+		domains[i] = domain.Name
+	}
+
+	return domains, nil
+}
+
+func listAllAttachedPvs(cfg *Config) map[string]string {
+	attachedPvs := make(map[string]string)
+
+	domainList, err := listDomains(cfg)
+	if err != nil {
+		klog.Error(err.Error())
+		return attachedPvs
+	}
+
+	for _, domain := range domainList {
+		attachedDevices, err := detectBlockDevices(cfg, domain)
+		if err != nil {
+			klog.Error("listAllAttachedPvs for %s error:", domain, err)
+			continue
+		}
+		for device := range attachedDevices.AttachedDevices {
+			attachedPvs[device] = domain
+		}
+	}
+
+	klog.InfoS("attached pvs", "pvs", attachedPvs)
+
+	return attachedPvs
 }
