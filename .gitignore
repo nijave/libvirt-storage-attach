@@ -22,3 +22,4 @@ go.work
 
 # IDE files
 .idea
+libvirt-storage-attach

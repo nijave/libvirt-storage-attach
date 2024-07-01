@@ -49,7 +49,7 @@ func detectBlockDevices(cfg *Config, domainName string) (deviceSummary, error) {
 	for _, dev := range result {
 		device := xmlquery.FindOne(dev, "/source").SelectAttr("dev")
 		target := xmlquery.FindOne(dev, "/target").SelectAttr("dev")
-		klog.InfoS("found device", "vm-name", domainName, "target", target, "device", device)
+		// klog.InfoS("found device", "vm-name", domainName, "target", target, "device", device)
 
 		if strings.HasPrefix(target, "sd") || strings.HasPrefix(target, "vd") {
 			summary.UsedTargets[target[2:]] = true
@@ -106,8 +106,8 @@ func listDomains(cfg *Config) ([]string, error) {
 	return domains, nil
 }
 
-func listAllAttachedPvs(cfg *Config) map[string]string {
-	attachedPvs := make(map[string]string)
+func listAllAttachedPvs(cfg *Config) map[string][]string {
+	attachedPvs := make(map[string][]string)
 
 	domainList, err := listDomains(cfg)
 	if err != nil {
@@ -122,11 +122,39 @@ func listAllAttachedPvs(cfg *Config) map[string]string {
 			continue
 		}
 		for device := range attachedDevices.AttachedDevices {
-			attachedPvs[device] = domain
+			attachedPvs[device] = append(attachedPvs[device], domain)
 		}
 	}
 
 	klog.InfoS("attached pvs", "pvs", attachedPvs)
 
 	return attachedPvs
+}
+
+func persistDomainConfig(cfg *Config, domainName string) error {
+	klog.InfoS("persisting domain config", "vm-name", domainName)
+
+	uri, _ := url.Parse(cfg.QemuUrl)
+	virtConn, err := libvirt.ConnectToURI(uri)
+	defer virtConn.Disconnect()
+	if err != nil {
+		return err
+	}
+
+	domain, err := virtConn.DomainLookupByName(domainName)
+	if err != nil {
+		return err
+	}
+
+	xml, err := virtConn.DomainGetXMLDesc(domain, libvirt.DomainXMLSecure)
+	if err != nil {
+		return err
+	}
+
+	_, err = virtConn.DomainDefineXMLFlags(xml, libvirt.DomainDefineValidate)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
