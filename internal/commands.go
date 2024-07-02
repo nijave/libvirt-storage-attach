@@ -167,6 +167,11 @@ func (c *LockingVmContext) Detach() error {
 			return err
 		}
 
+		err = persistDomainConfig(c.Cfg, c.VmName)
+		if err != nil {
+			klog.ErrorS(err, "couldn't persist domain config", "vm-name", c.VmName)
+		}
+
 		// Remove from lock
 		return c.PvLock.Truncate(0)
 	} else {
