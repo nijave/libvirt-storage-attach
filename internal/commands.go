@@ -108,26 +108,16 @@ func (c *LockingVmContext) Attach() error {
 		))
 
 		if err != nil {
-			klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
+			klog.ErrorS(err, "failed to attach-device", "vm-name", c.VmName, "stdout", stdout, "stderr", stderr)
 			return err
 		}
 
-		stdout, stderr, err = processOutput(exec.CommandContext(
-			timeout,
-			"virsh",
-			fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
-			"attach-device",
-			"--persistent",
-			c.VmName,
-			xmlFilePath,
-		))
-
-		if err != nil {
-			klog.InfoS("command output", "stdout", stdout, "stderr", stderr, "err", err)
-			//return err
-		}
-
 		os.Remove(xmlFilePath)
+
+		err = persistDomainConfig(c.Cfg, c.VmName)
+		if err != nil {
+			klog.ErrorS(err, "couldn't persist domain config", "vm-name", c.VmName)
+		}
 
 		// TODO maybe exit code = 0 is sufficient
 		if stdout != "Device attached successfully" {
@@ -232,7 +222,7 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 			owners := &[]string{}
 			klog.InfoS("checking for pv owners", "pv", pvId)
 			if domain, ok := attachedPvs[pvId]; ok {
-				owners = &[]string{domain}
+				owners = &domain
 			}
 			volumeInfo = append(volumeInfo, &VolumeInfo{
 				Id:       parts[0],
