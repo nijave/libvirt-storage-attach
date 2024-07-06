@@ -28,6 +28,9 @@ func main() {
 	var operation string
 	flag.StringVar(&operation, "operation", "", "attach, detach, create, delete")
 
+	var volumeGroup string
+	flag.StringVar(&volumeGroup, "volume-group", cfg.LvmVolumeGroup, "volume group name")
+
 	var pvId string
 	flag.StringVar(&pvId, "pv-id", "", "persistent volume id")
 
@@ -127,7 +130,7 @@ func main() {
 			Cfg:  cfg,
 			PvId: "",
 		}
-		pvId, err = c.CreateVolume(volumeSize)
+		pvId, err = c.CreateVolume(volumeSize, volumeGroup)
 		if len(pvId) > 0 {
 			fmt.Println(pvId)
 		}
