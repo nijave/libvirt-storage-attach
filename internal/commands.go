@@ -24,6 +24,31 @@ type LockingVmContext struct {
 	VmLock *os.File
 }
 
+type VolumeInfo struct {
+	Id       string
+	Capacity uint64
+	Owners   []string
+}
+
+func (c *LockingVmContext) volumeGroupAndLv() (string, string) {
+	var volumeGroup string
+	volumeGroupMapping := getVolumeVolumeGroupMapping()
+
+	if _, ok := volumeGroupMapping[c.PvId]; !ok {
+		// The default volume group can reference a thin pool
+		volumeGroup = strings.Split(c.Cfg.LvmVolumeGroup, "/")[0]
+	} else {
+		volumeGroup = volumeGroupMapping[c.PvId]
+	}
+
+	return volumeGroup, c.PvId
+}
+
+func (c *LockingVmContext) lvWithVolumeGroup() string {
+	vg, lv := c.volumeGroupAndLv()
+	return strings.Join([]string{vg, lv}, "/")
+}
+
 func (c *LockingVmContext) WithLock(lockVm bool, fn func() error) error {
 	var vmLock *os.File
 	if lockVm {
@@ -77,10 +102,11 @@ func (c *LockingVmContext) Attach() error {
 		return err
 	}
 	if _, attached := summary.AttachedDevices[c.PvId]; !attached {
+		vg, lv := c.volumeGroupAndLv()
 		klog.InfoS("attaching device", "pv-id", c.PvId, "vm-name", c.VmName, "target", summary.NextTarget)
 
 		// attach code (after writing state update to lock)
-		devicePath := fmt.Sprintf("/dev/%s/%s", strings.Split(c.Cfg.LvmVolumeGroup, "/")[0], c.PvId)
+		devicePath := fmt.Sprintf("/dev/%s/%s", vg, lv)
 		deviceXmlTmpl := `
 <disk type='block' device='disk'>
   <driver name='qemu' type='raw' cache='writeback' discard='unmap'/>
@@ -180,15 +206,10 @@ func (c *LockingVmContext) Detach() error {
 	}
 }
 
-type VolumeInfo struct {
-	Id       string
-	Capacity uint64
-	Owners   []string
-}
-
 func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 	var volumeInfo []*VolumeInfo
 
+	vg, _ := c.volumeGroupAndLv()
 	stdout, stderr, err := processOutput(exec.CommandContext(
 		c.Ctx,
 		"lvs",
@@ -203,7 +224,7 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 		fmt.Sprintf(
 			"name=~%s[^.]+ && vg_name=%s",
 			c.Cfg.VolumePrefix,
-			strings.Split(c.Cfg.LvmVolumeGroup, "/")[0],
+			vg,
 		),
 	))
 
@@ -264,22 +285,28 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 	return volumeInfo, nil
 }
 
-func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize) (string, error) {
+func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize, volumeGroup string) (string, error) {
 	pvUuid, err := uuid.NewV7()
 	if err != nil {
 		return "", err
 	}
 	c.PvId = fmt.Sprintf("%s%s", c.Cfg.VolumePrefix, pvUuid.String())
 
-	klog.InfoS("creating logical volume", "pv-id", c.PvId, "size", volumeSize)
+	sizeFlag := "-L"
+	if strings.Contains(volumeGroup, "/") {
+		// Probably creating a thin provisioned volume i.e. vg-name/thin-pool-name
+		sizeFlag = "-V"
+	}
+
+	klog.InfoS("creating logical volume", "pv-id", c.PvId, "size", volumeSize, "volume-group", volumeGroup)
 	// Create LV
 	stdout, stderr, err := processOutput(
 		exec.CommandContext(
 			c.Ctx,
 			"lvcreate",
-			"-V",
+			sizeFlag,
 			volumeSize.String(),
-			c.Cfg.LvmVolumeGroup,
+			volumeGroup,
 			"-n",
 			c.PvId,
 		),
@@ -301,10 +328,7 @@ func (c *LockingVmContext) DeleteVolume() error {
 			c.Ctx,
 			"lvremove",
 			"--yes",
-			strings.Join([]string{
-				strings.Split(c.Cfg.LvmVolumeGroup, "/")[0],
-				c.PvId,
-			}, "/"),
+			c.lvWithVolumeGroup(),
 		),
 	)
 
