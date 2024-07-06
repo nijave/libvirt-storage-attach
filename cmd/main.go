@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 	"libvirt-storage-attach/internal"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -77,6 +78,11 @@ func main() {
 		if volumeSize < datasize.GB {
 			klog.Error(errors.New("size must be at least 1GB"))
 			os.Exit(255)
+		}
+
+		// Reset VG to default if an empty string was passed
+		if strings.TrimSpace(volumeGroup) == "" {
+			volumeGroup = cfg.LvmVolumeGroup
 		}
 	}
 
