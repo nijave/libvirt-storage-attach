@@ -10,8 +10,10 @@ import (
 	"github.com/google/uuid"
 	"k8s.io/klog/v2"
 	"libvirt-storage-attach/internal"
+	"libvirt-storage-attach/internal/lvm"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -29,8 +31,8 @@ func main() {
 	var operation string
 	flag.StringVar(&operation, "operation", "", "attach, detach, create, delete")
 
-	var volumeGroup string
-	flag.StringVar(&volumeGroup, "volume-group", cfg.LvmVolumeGroup, "volume group name")
+	var volumePath string
+	flag.StringVar(&volumePath, "volume-group", cfg.LvmVolumeGroup, "volume group name")
 
 	var pvId string
 	flag.StringVar(&pvId, "pv-id", "", "persistent volume id")
@@ -81,8 +83,8 @@ func main() {
 		}
 
 		// Reset VG to default if an empty string was passed
-		if strings.TrimSpace(volumeGroup) == "" {
-			volumeGroup = cfg.LvmVolumeGroup
+		if strings.TrimSpace(volumePath) == "" {
+			volumePath = cfg.LvmVolumeGroup
 		}
 	}
 
@@ -98,32 +100,45 @@ func main() {
 
 	klog.InfoS("running", "operation", operation, "pv-id", pvId, "vm-name", vmName, "volumeSize", volumeSize)
 
+	ctx := context.Background()
+	c := &internal.LockingVmContext{
+		Ctx:    ctx,
+		Cfg:    cfg,
+		VmName: vmName,
+		PvId:   pvId,
+	}
+
+	var volumeManager internal.VolumeManager
+
+	volumeGroupParts := strings.SplitN(volumePath, ":", 2)
+
+	if len(volumeGroupParts) == 1 || volumeGroupParts[0] == "lvm" {
+		volumeManager = &lvm.VolumeManager{
+			LockingVmContext: c,
+			VolumeGroup:      volumePath,
+		}
+	} else if volumeGroupParts[0] == "file" {
+		// TODO qcow2 file volume manager
+	}
+
+	if volumeManager == nil {
+		klog.Fatalf("couldn't determine volume manager for %s", volumeGroupParts[0])
+	}
+
 	switch operation {
 	case "attach":
-		c := internal.LockingVmContext{
-			Ctx:    context.Background(),
-			Cfg:    cfg,
-			VmName: vmName,
-			PvId:   pvId,
-		}
-		err = c.WithLock(true, c.Attach)
+		err = c.WithLock(true, volumeManager.Attach)
 
 	case "detach":
-		c := internal.LockingVmContext{
-			Ctx:    context.Background(),
-			Cfg:    cfg,
-			VmName: vmName,
-			PvId:   pvId,
-		}
-		err = c.WithLock(true, c.Detach)
+		err = c.WithLock(true, volumeManager.Detach)
 
 	case "list":
-		c := internal.LockingVmContext{
-			Ctx: context.Background(),
-			Cfg: cfg,
-		}
+		timeoutCtx, cancel := context.WithTimeout(c.Ctx, 10*time.Second)
+		defer cancel()
+		c.Ctx = timeoutCtx
+
 		var out []*internal.VolumeInfo
-		out, err = c.ListVolumes()
+		out, err = volumeManager.ListVolumes()
 		if err == nil {
 			var outJson []byte
 			outJson, err = json.Marshal(out)
@@ -131,24 +146,15 @@ func main() {
 		}
 
 	case "create":
-		c := internal.LockingVmContext{
-			Ctx:  context.Background(),
-			Cfg:  cfg,
-			PvId: "",
-		}
-		pvId, err = c.CreateVolume(volumeSize, volumeGroup)
+		c.PvId = ""
+		pvId, err = volumeManager.CreateVolume(volumeSize)
 		if len(pvId) > 0 {
 			fmt.Println(pvId)
 		}
 
 	case "delete":
-		c := internal.LockingVmContext{
-			Ctx:    context.Background(),
-			Cfg:    cfg,
-			PvId:   pvId,
-			VmName: "",
-		}
-		err = c.WithLock(false, c.DeleteVolume)
+		c.VmName = ""
+		err = c.WithLock(false, volumeManager.DeleteVolume)
 	}
 
 	if err != nil {

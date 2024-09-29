@@ -15,7 +15,7 @@ type deviceSummary struct {
 	NextTarget      string
 }
 
-func detectBlockDevices(cfg *Config, domainName string) (deviceSummary, error) {
+func DetectBlockDevices(cfg *Config, domainName string) (deviceSummary, error) {
 	summary := deviceSummary{
 		UsedTargets:     map[string]bool{},
 		AttachedDevices: map[string]bool{},
@@ -106,7 +106,7 @@ func listDomains(cfg *Config) ([]string, error) {
 	return domains, nil
 }
 
-func listAllAttachedPvs(cfg *Config) map[string][]string {
+func ListAllAttachedPvs(cfg *Config) map[string][]string {
 	attachedPvs := make(map[string][]string)
 
 	domainList, err := listDomains(cfg)
@@ -116,7 +116,7 @@ func listAllAttachedPvs(cfg *Config) map[string][]string {
 	}
 
 	for _, domain := range domainList {
-		attachedDevices, err := detectBlockDevices(cfg, domain)
+		attachedDevices, err := DetectBlockDevices(cfg, domain)
 		if err != nil {
 			klog.Error("listAllAttachedPvs for %s error:", domain, err)
 			continue
@@ -131,7 +131,7 @@ func listAllAttachedPvs(cfg *Config) map[string][]string {
 	return attachedPvs
 }
 
-func persistDomainConfig(cfg *Config, domainName string) error {
+func PersistDomainConfig(cfg *Config, domainName string) error {
 	klog.InfoS("persisting domain config", "vm-name", domainName)
 
 	uri, _ := url.Parse(cfg.QemuUrl)

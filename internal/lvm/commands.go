@@ -1,36 +1,71 @@
-package internal
+package lvm
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/c2h5oh/datasize"
 	"github.com/google/uuid"
-	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
+	"libvirt-storage-attach/internal"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
-type LockingVmContext struct {
-	Ctx    context.Context
-	Cfg    *Config
-	VmName string
-	PvId   string
-	PvLock *os.File
-	VmLock *os.File
+type LogicalVolume struct {
+	LogicalVolume string `json:"lv_name"`
+	VolumeGroup   string `json:"vg_name"`
 }
 
-type VolumeInfo struct {
-	Id       string
-	Capacity uint64
-	Owners   []string
+type LvReport struct {
+	Report []LogicalVolume `json:"lv"`
 }
 
-func (c *LockingVmContext) volumeGroupAndLv() (string, string) {
+type LvmReportList struct {
+	Reports []LvReport `json:"report"`
+}
+
+type VolumeManager struct {
+	LockingVmContext *internal.LockingVmContext
+	VolumeGroup      string
+}
+
+func getVolumeVolumeGroupMapping() map[string]string {
+	mapping := make(map[string]string)
+
+	stdout, err := exec.Command(
+		"lvs",
+		"-o", "vg_name,lv_name",
+		"--reportformat", "json",
+	).Output()
+
+	if err != nil {
+		klog.ErrorS(err, "failed to get logical volume info")
+		return mapping
+	}
+
+	var report LvmReportList
+	err = json.Unmarshal(stdout, &report)
+
+	if err != nil {
+		klog.ErrorS(err, "failed to unmarshal logical volume info")
+		return mapping
+	}
+
+	// There should only be a single report
+	for _, report := range report.Reports {
+		for _, lv := range report.Report {
+			mapping[lv.LogicalVolume] = lv.VolumeGroup
+		}
+	}
+
+	return mapping
+}
+
+func (vManager *VolumeManager) volumeGroupAndLv() (string, string) {
+	c := vManager.LockingVmContext
 	var volumeGroup string
 	volumeGroupMapping := getVolumeVolumeGroupMapping()
 
@@ -44,65 +79,19 @@ func (c *LockingVmContext) volumeGroupAndLv() (string, string) {
 	return volumeGroup, c.PvId
 }
 
-func (c *LockingVmContext) lvWithVolumeGroup() string {
-	vg, lv := c.volumeGroupAndLv()
+func (vManager *VolumeManager) lvWithVolumeGroup() string {
+	vg, lv := vManager.volumeGroupAndLv()
 	return strings.Join([]string{vg, lv}, "/")
 }
 
-func (c *LockingVmContext) WithLock(lockVm bool, fn func() error) error {
-	var vmLock *os.File
-	if lockVm {
-		vmLock, _ := os.Create(filepath.Join(c.Cfg.LockPath, c.VmName))
-		if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-			return err
-		}
-		c.VmLock = vmLock
-	}
-
-	pvLock, _ := os.OpenFile(filepath.Join(c.Cfg.LockPath, c.PvId), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
-	if err := unix.Flock(int(pvLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return err
-	}
-	c.PvLock = pvLock
-
-	pvOwner := bufio.NewScanner(pvLock).Text()
-	klog.InfoS("device ownership", "pv-id", c.PvId, "vm-name", pvOwner)
-
-	if len(pvOwner) > 0 && pvOwner != c.VmName {
-		return fmt.Errorf("pv %s is in use can't be modified by '%s' since it's locked by '%s'", c.PvId, c.VmName, pvOwner)
-	}
-
-	if len(pvOwner) == 0 {
-		_, err := c.PvLock.WriteString(c.VmName)
-		if err != nil {
-			return err
-		}
-	}
-
-	innerError := fn()
-
-	if vmLock != nil {
-		if err := unix.Flock(int(vmLock.Fd()), unix.LOCK_UN); err != nil {
-			return err
-		}
-		c.VmLock = nil
-	}
-
-	if err := unix.Flock(int(pvLock.Fd()), unix.LOCK_UN); err != nil {
-		return err
-	}
-	c.PvLock = nil
-
-	return innerError
-}
-
-func (c *LockingVmContext) Attach() error {
-	summary, err := detectBlockDevices(c.Cfg, c.VmName)
+func (vManager *VolumeManager) Attach() error {
+	c := vManager.LockingVmContext
+	summary, err := internal.DetectBlockDevices(c.Cfg, c.VmName)
 	if err != nil {
 		return err
 	}
 	if _, attached := summary.AttachedDevices[c.PvId]; !attached {
-		vg, lv := c.volumeGroupAndLv()
+		vg, lv := vManager.volumeGroupAndLv()
 		klog.InfoS("attaching device", "pv-id", c.PvId, "vm-name", c.VmName, "target", summary.NextTarget)
 
 		// attach code (after writing state update to lock)
@@ -117,13 +106,13 @@ func (c *LockingVmContext) Attach() error {
 `
 		deviceSerial := strings.Replace(strings.TrimPrefix(c.PvId, c.Cfg.VolumePrefix), "-", "", -1)
 		deviceXml := fmt.Sprintf(deviceXmlTmpl, devicePath, summary.NextTarget, deviceSerial)
-		xmlFilePath, err := writeTempFile(c.PvId, deviceXml)
+		xmlFilePath, err := internal.WriteTempFile(c.PvId, deviceXml)
 		if err != nil {
 			return err
 		}
 
 		timeout, _ := context.WithTimeout(c.Ctx, c.Cfg.AttachTimeout)
-		stdout, stderr, err := processOutput(exec.CommandContext(
+		stdout, stderr, err := internal.ProcessOutput(exec.CommandContext(
 			timeout,
 			"virsh",
 			fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
@@ -140,7 +129,7 @@ func (c *LockingVmContext) Attach() error {
 
 		os.Remove(xmlFilePath)
 
-		err = persistDomainConfig(c.Cfg, c.VmName)
+		err = internal.PersistDomainConfig(c.Cfg, c.VmName)
 		if err != nil {
 			klog.ErrorS(err, "couldn't persist domain config", "vm-name", c.VmName)
 		}
@@ -156,11 +145,12 @@ func (c *LockingVmContext) Attach() error {
 	return nil
 }
 
-func (c *LockingVmContext) Detach() error {
+func (vManager *VolumeManager) Detach() error {
+	c := vManager.LockingVmContext
 	var err error
 
 	timeout, _ := context.WithTimeout(c.Ctx, c.Cfg.DetachTimeout)
-	summary, err := detectBlockDevices(c.Cfg, c.VmName)
+	summary, err := internal.DetectBlockDevices(c.Cfg, c.VmName)
 
 	if err != nil && strings.HasPrefix(err.Error(), "Domain not found: ") {
 		return nil
@@ -174,12 +164,12 @@ func (c *LockingVmContext) Detach() error {
 		klog.InfoS("found device xml", "pv-id", c.PvId, "vm-name", c.VmName, "xml", deviceXml)
 
 		// Remove from VM
-		xmlFilePath, err := writeTempFile(c.PvId, deviceXml)
+		xmlFilePath, err := internal.WriteTempFile(c.PvId, deviceXml)
 		if err != nil {
 			return err
 		}
 
-		stdout, stderr, err := processOutput(
+		stdout, stderr, err := internal.ProcessOutput(
 			exec.CommandContext(
 				timeout, "virsh",
 				fmt.Sprintf("--connect=%s", c.Cfg.QemuUrl),
@@ -193,7 +183,7 @@ func (c *LockingVmContext) Detach() error {
 			return err
 		}
 
-		err = persistDomainConfig(c.Cfg, c.VmName)
+		err = internal.PersistDomainConfig(c.Cfg, c.VmName)
 		if err != nil {
 			klog.ErrorS(err, "couldn't persist domain config", "vm-name", c.VmName)
 		}
@@ -206,11 +196,12 @@ func (c *LockingVmContext) Detach() error {
 	}
 }
 
-func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
-	var volumeInfo []*VolumeInfo
+func (vManager *VolumeManager) ListVolumes() ([]*internal.VolumeInfo, error) {
+	c := vManager.LockingVmContext
+	var volumeInfo []*internal.VolumeInfo
 
-	vg, _ := c.volumeGroupAndLv()
-	stdout, stderr, err := processOutput(exec.CommandContext(
+	vg, _ := vManager.volumeGroupAndLv()
+	stdout, stderr, err := internal.ProcessOutput(exec.CommandContext(
 		c.Ctx,
 		"lvs",
 		"--noheadings",
@@ -236,7 +227,7 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 		return volumeInfo, err
 	}
 
-	attachedPvs := listAllAttachedPvs(c.Cfg)
+	attachedPvs := internal.ListAllAttachedPvs(c.Cfg)
 
 	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
 		line = strings.TrimSpace(line)
@@ -250,7 +241,7 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 			if domain, ok := attachedPvs[pvId]; ok {
 				owners = &domain
 			}
-			volumeInfo = append(volumeInfo, &VolumeInfo{
+			volumeInfo = append(volumeInfo, &internal.VolumeInfo{
 				Id:       parts[0],
 				Capacity: dataSize.Bytes(),
 				Owners:   *owners,
@@ -285,7 +276,8 @@ func (c *LockingVmContext) ListVolumes() ([]*VolumeInfo, error) {
 	return volumeInfo, nil
 }
 
-func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize, volumeGroup string) (string, error) {
+func (vManager *VolumeManager) CreateVolume(volumeSize datasize.ByteSize) (string, error) {
+	c := vManager.LockingVmContext
 	pvUuid, err := uuid.NewV7()
 	if err != nil {
 		return "", err
@@ -293,20 +285,20 @@ func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize, volumeGrou
 	c.PvId = fmt.Sprintf("%s%s", c.Cfg.VolumePrefix, pvUuid.String())
 
 	sizeFlag := "-L"
-	if strings.Contains(volumeGroup, "/") {
+	if strings.Contains(vManager.VolumeGroup, "/") {
 		// Probably creating a thin provisioned volume i.e. vg-name/thin-pool-name
 		sizeFlag = "-V"
 	}
 
-	klog.InfoS("creating logical volume", "pv-id", c.PvId, "size", volumeSize, "volume-group", volumeGroup)
+	klog.InfoS("creating logical volume", "pv-id", c.PvId, "size", volumeSize, "volume-group", vManager.VolumeGroup)
 	// Create LV
-	stdout, stderr, err := processOutput(
+	stdout, stderr, err := internal.ProcessOutput(
 		exec.CommandContext(
 			c.Ctx,
 			"lvcreate",
 			sizeFlag,
 			volumeSize.String(),
-			volumeGroup,
+			vManager.VolumeGroup,
 			"-n",
 			c.PvId,
 		),
@@ -321,14 +313,15 @@ func (c *LockingVmContext) CreateVolume(volumeSize datasize.ByteSize, volumeGrou
 	return c.PvId, nil
 }
 
-func (c *LockingVmContext) DeleteVolume() error {
+func (vManager *VolumeManager) DeleteVolume() error {
+	c := vManager.LockingVmContext
 	klog.InfoS("deleting logical volume", "pv-id", c.PvId)
-	stdout, stderr, err := processOutput(
+	stdout, stderr, err := internal.ProcessOutput(
 		exec.CommandContext(
 			c.Ctx,
 			"lvremove",
 			"--yes",
-			c.lvWithVolumeGroup(),
+			vManager.lvWithVolumeGroup(),
 		),
 	)
 
